@@ -175,6 +175,11 @@ svg{display:inline-block;vertical-align:middle}
 .img-resize-wrap.selected{outline:2px solid var(--indigo);border-radius:8px}
 .resize-handle{display:none;position:absolute;width:11px;height:11px;background:white;border:2px solid var(--indigo);border-radius:2px;z-index:20;box-shadow:0 1px 4px rgba(0,0,0,.25);touch-action:none}
 .img-resize-wrap.selected .resize-handle{display:block}
+.img-resize-wrap.enviando img{opacity:.5}
+.img-resize-wrap .img-upload-overlay{display:none;position:absolute;inset:0;align-items:center;justify-content:center;gap:7px;color:#fff;font-size:12px;font-weight:600;background:rgba(16,24,40,.35);border-radius:8px}
+.img-resize-wrap.enviando .img-upload-overlay{display:flex}
+.img-upload-spinner{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .resize-handle.se{bottom:-6px;right:-6px;cursor:se-resize}
 .resize-handle.sw{bottom:-6px;left:-6px;cursor:sw-resize}
 .resize-handle.ne{top:-6px;right:-6px;cursor:ne-resize}
@@ -1365,27 +1370,96 @@ function fazerImgWrap(src){
   img.style.cssText='width:100%;height:auto;display:block;border-radius:8px'
   const wrap=criarWrap('')
   wrap.insertBefore(img,wrap.firstChild)
+  const overlay=document.createElement('div')
+  overlay.className='img-upload-overlay'
+  overlay.innerHTML='<span class="img-upload-spinner"></span>Enviando...'
+  wrap.appendChild(overlay)
   return wrap
+}
+
+// Contador global de uploads de imagem ainda em andamento — salvarResumo()
+// verifica isso antes de salvar, pra não gravar um resumo com imagem que
+// ainda não terminou de subir pro Storage.
+window._uploadsPendentes=0
+
+// Sobe a imagem em segundo plano e, quando terminar, troca o base64 (pesado)
+// pela URL do Storage (leve) — é essa URL que efetivamente fica salva no
+// resumo. Mostra um "Enviando..." sobre a imagem enquanto isso acontece.
+function subirImagemEmSegundoPlano(wrap,dataUrl){
+  if(typeof window.uploadImagemParaStorage!=='function'){
+    toast('Upload de imagem indisponível — Firebase ainda não conectou. Tente novamente em instantes.','error')
+    return
+  }
+  window._uploadsPendentes++
+  wrap.classList.add('enviando')
+  window.uploadImagemParaStorage(dataUrl).then(url=>{
+    const img=wrap.querySelector('img')
+    if(img) img.src=url
+    wrap.querySelector('.img-upload-overlay')?.remove()
+  }).catch(err=>{
+    console.error('Falha ao subir imagem para o Storage',err)
+    toast('Não foi possível enviar a imagem — tente colar de novo','error')
+    wrap.querySelector('.img-upload-overlay')?.remove()
+  }).finally(()=>{
+    window._uploadsPendentes--
+    wrap.classList.remove('enviando')
+  })
 }
 
 function handlePaste(e){
   const items=e.clipboardData?.items
-  if(!items) return
-  for(const item of items){
-    if(item.type.startsWith('image/')){
-      e.preventDefault()
-      const reader=new FileReader()
-      reader.onload=ev=>inserirWrapNoEditor(fazerImgWrap(ev.target.result))
-      reader.readAsDataURL(item.getAsFile())
-      return
+  if(items){
+    for(const item of items){
+      if(item.type.startsWith('image/')){
+        e.preventDefault()
+        const reader=new FileReader()
+        reader.onload=ev=>{
+          const wrap=fazerImgWrap(ev.target.result)
+          inserirWrapNoEditor(wrap)
+          subirImagemEmSegundoPlano(wrap,ev.target.result)
+        }
+        reader.readAsDataURL(item.getAsFile())
+        return
+      }
     }
   }
+  // Colar HTML rico (copiado de Word/páginas web) pode trazer <img> com
+  // base64 embutido direto, sem passar pelo caminho acima. Depois que o
+  // navegador processar o paste, varremos o editor em busca disso.
+  setTimeout(capturarImagensBase64Soltas,50)
+}
+
+// Rede de segurança: qualquer <img> com src em base64 que apareça no editor
+// (por colagem de HTML rico, por exemplo) é capturada e enviada pro Storage,
+// do mesmo jeito que uma imagem colada diretamente.
+function capturarImagensBase64Soltas(){
+  const editor=document.getElementById('editor')
+  editor.querySelectorAll('img').forEach(img=>{
+    if(!img.src.startsWith('data:')) return
+    let wrap=img.closest('.img-resize-wrap')
+    if(!wrap){
+      wrap=criarWrap('')
+      img.replaceWith(wrap)
+      wrap.insertBefore(img,wrap.firstChild)
+      img.style.cssText='width:100%;height:auto;display:block;border-radius:8px'
+    }
+    if(wrap.querySelector('.img-upload-overlay')) return // já está subindo
+    const overlay=document.createElement('div')
+    overlay.className='img-upload-overlay'
+    overlay.innerHTML='<span class="img-upload-spinner"></span>Enviando...'
+    wrap.appendChild(overlay)
+    subirImagemEmSegundoPlano(wrap,img.src)
+  })
 }
 
 function inserirImagem(e){
   const file=e.target.files[0];if(!file) return
   const reader=new FileReader()
-  reader.onload=ev=>inserirWrapNoEditor(fazerImgWrap(ev.target.result))
+  reader.onload=ev=>{
+    const wrap=fazerImgWrap(ev.target.result)
+    inserirWrapNoEditor(wrap)
+    subirImagemEmSegundoPlano(wrap,ev.target.result)
+  }
   reader.readAsDataURL(file)
   e.target.value=''
 }
@@ -1518,11 +1592,13 @@ function salvarResumo(){
   const titulo=document.getElementById('f-titulo').value.trim()
   const disciplina=document.getElementById('f-disciplina').value.trim()
   const assunto=document.getElementById('f-assunto').value.trim()
-  const conteudo=getEditorHTML()
-  const textoPlain=getEditorText()
   if(!titulo){toast('Informe o título','error');return}
   if(!disciplina){toast('Informe a disciplina','error');return}
+  if(window._uploadsPendentes>0){toast('Aguarde a imagem terminar de enviar...','error');return}
+  const conteudo=getEditorHTML()
+  const textoPlain=getEditorText()
   if(!textoPlain.trim()&&!conteudo.includes('<img')){toast('Escreva o conteúdo','error');return}
+  if(conteudo.includes('data:image')){toast('Uma imagem ainda não terminou de enviar — aguarde alguns segundos e tente salvar de novo','error');return}
   if(_editandoId){
     DB.update(_editandoId,{titulo,disciplina,assunto,conteudo,textoPlain,questoes:_questoesForm,updatedAt:new Date().toISOString()})
     toast('Resumo atualizado!')
@@ -2048,6 +2124,9 @@ import {
 import {
   getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js"
+import {
+  getStorage, ref, uploadBytes, getDownloadURL
+} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js"
 
 // ────────────────────────────────────────────────────────────────────────────
 // COLE AQUI AS CREDENCIAIS DO SEU PROJETO FIREBASE
@@ -2070,12 +2149,13 @@ const firebaseConfig = {
 // ────────────────────────────────────────────────────────────────────────────
 const CODIGO_DO_CADERNO = "meu-caderno-principal"
 
-let app,auth,firestore
+let app,auth,firestore,storage
 let _falhaConfig=false
 try{
   app=initializeApp(firebaseConfig)
   auth=getAuth(app)
   firestore=getFirestore(app)
+  storage=getStorage(app)
   setPersistence(auth,browserLocalPersistence).catch(()=>{})
 }catch(e){
   _falhaConfig=true
@@ -2092,6 +2172,21 @@ function _rerenderTudo(){
   if(typeof window.renderFavoritos==='function') window.renderFavoritos()
   if(typeof window.renderSumario==='function') window.renderSumario()
   if(typeof window.renderBackup==='function') window.renderBackup()
+}
+
+// Sobe uma imagem (data URL base64) para o Firebase Storage e devolve a URL
+// pública dela. Isso existe porque o Firestore tem um limite de 1MB por
+// documento — guardar a imagem inteira em base64 dentro do resumo estoura
+// esse limite rapidinho. Guardando só a URL, o resumo fica leve.
+window.uploadImagemParaStorage=async function(dataUrl){
+  if(!storage) throw new Error('Firebase Storage não inicializado')
+  const res=await fetch(dataUrl)
+  const blob=await res.blob()
+  const ext=(blob.type.split('/')[1]||'png').replace('jpeg','jpg')
+  const nomeArquivo=`imagens/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`
+  const storageRef=ref(storage,nomeArquivo)
+  await uploadBytes(storageRef,blob)
+  return await getDownloadURL(storageRef)
 }
 function _toastSeDisponivel(msg,tipo){
   if(typeof window.toast==='function') window.toast(msg,tipo)
