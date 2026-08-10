@@ -1372,33 +1372,57 @@ function fazerImgWrap(src){
   wrap.insertBefore(img,wrap.firstChild)
   const overlay=document.createElement('div')
   overlay.className='img-upload-overlay'
-  overlay.innerHTML='<span class="img-upload-spinner"></span>Enviando...'
+  overlay.innerHTML='<span class="img-upload-spinner"></span>Otimizando...'
   wrap.appendChild(overlay)
   return wrap
 }
 
-// Contador global de uploads de imagem ainda em andamento — salvarResumo()
-// verifica isso antes de salvar, pra não gravar um resumo com imagem que
-// ainda não terminou de subir pro Storage.
+// Contador global de imagens ainda sendo processadas — salvarResumo()
+// verifica isso antes de salvar, pra não gravar o resumo no meio do processo.
 window._uploadsPendentes=0
 
-// Sobe a imagem em segundo plano e, quando terminar, troca o base64 (pesado)
-// pela URL do Storage (leve) — é essa URL que efetivamente fica salva no
-// resumo. Mostra um "Enviando..." sobre a imagem enquanto isso acontece.
-function subirImagemEmSegundoPlano(wrap,dataUrl){
-  if(typeof window.uploadImagemParaStorage!=='function'){
-    toast('Upload de imagem indisponível — Firebase ainda não conectou. Tente novamente em instantes.','error')
-    return
-  }
+// Redimensiona e comprime a imagem no próprio navegador (sem depender de
+// nenhum servidor externo) antes de guardá-la no resumo. Isso existe porque
+// o Firestore tem um limite de 1MB por documento — uma foto direto da
+// câmera facilmente passa disso; comprimida, fica bem confortável.
+function comprimirImagem(dataUrl){
+  return new Promise((resolve,reject)=>{
+    const img=new Image()
+    img.onload=()=>{
+      const maxW=1280
+      let w=img.width,h=img.height
+      if(w>maxW){ h=Math.round(h*(maxW/w)); w=maxW }
+      const canvas=document.createElement('canvas')
+      canvas.width=w; canvas.height=h
+      const ctx=canvas.getContext('2d')
+      ctx.drawImage(img,0,0,w,h)
+      let qualidade=0.8
+      let saida=canvas.toDataURL('image/jpeg',qualidade)
+      // Reduz a qualidade gradualmente até caber num tamanho seguro
+      while(saida.length>500000 && qualidade>0.35){
+        qualidade-=0.1
+        saida=canvas.toDataURL('image/jpeg',qualidade)
+      }
+      resolve(saida)
+    }
+    img.onerror=()=>reject(new Error('Não foi possível processar a imagem'))
+    img.src=dataUrl
+  })
+}
+
+function processarNovaImagem(wrap,dataUrl){
   window._uploadsPendentes++
   wrap.classList.add('enviando')
-  window.uploadImagemParaStorage(dataUrl).then(url=>{
+  comprimirImagem(dataUrl).then(dataUrlComprimido=>{
     const img=wrap.querySelector('img')
-    if(img) img.src=url
+    if(img){
+      img.src=dataUrlComprimido
+      img.dataset.otimizada='1'
+    }
     wrap.querySelector('.img-upload-overlay')?.remove()
   }).catch(err=>{
-    console.error('Falha ao subir imagem para o Storage',err)
-    toast('Não foi possível enviar a imagem — tente colar de novo','error')
+    console.error('Falha ao processar imagem',err)
+    toast('Não foi possível processar essa imagem — tente colar de novo','error')
     wrap.querySelector('.img-upload-overlay')?.remove()
   }).finally(()=>{
     window._uploadsPendentes--
@@ -1416,7 +1440,7 @@ function handlePaste(e){
         reader.onload=ev=>{
           const wrap=fazerImgWrap(ev.target.result)
           inserirWrapNoEditor(wrap)
-          subirImagemEmSegundoPlano(wrap,ev.target.result)
+          processarNovaImagem(wrap,ev.target.result)
         }
         reader.readAsDataURL(item.getAsFile())
         return
@@ -1429,13 +1453,15 @@ function handlePaste(e){
   setTimeout(capturarImagensBase64Soltas,50)
 }
 
-// Rede de segurança: qualquer <img> com src em base64 que apareça no editor
-// (por colagem de HTML rico, por exemplo) é capturada e enviada pro Storage,
-// do mesmo jeito que uma imagem colada diretamente.
+// Rede de segurança: qualquer <img> com base64 "cru" (grande, ainda não
+// otimizada) que apareça no editor — por exemplo colando HTML rico de um
+// Word ou página web — é capturada e comprimida, do mesmo jeito que uma
+// imagem colada diretamente.
 function capturarImagensBase64Soltas(){
   const editor=document.getElementById('editor')
   editor.querySelectorAll('img').forEach(img=>{
     if(!img.src.startsWith('data:')) return
+    if(img.dataset.otimizada || img.src.length<500000) return // já processada ou já pequena o suficiente
     let wrap=img.closest('.img-resize-wrap')
     if(!wrap){
       wrap=criarWrap('')
@@ -1443,12 +1469,12 @@ function capturarImagensBase64Soltas(){
       wrap.insertBefore(img,wrap.firstChild)
       img.style.cssText='width:100%;height:auto;display:block;border-radius:8px'
     }
-    if(wrap.querySelector('.img-upload-overlay')) return // já está subindo
+    if(wrap.querySelector('.img-upload-overlay')) return // já está processando
     const overlay=document.createElement('div')
     overlay.className='img-upload-overlay'
-    overlay.innerHTML='<span class="img-upload-spinner"></span>Enviando...'
+    overlay.innerHTML='<span class="img-upload-spinner"></span>Otimizando...'
     wrap.appendChild(overlay)
-    subirImagemEmSegundoPlano(wrap,img.src)
+    processarNovaImagem(wrap,img.src)
   })
 }
 
@@ -1458,7 +1484,7 @@ function inserirImagem(e){
   reader.onload=ev=>{
     const wrap=fazerImgWrap(ev.target.result)
     inserirWrapNoEditor(wrap)
-    subirImagemEmSegundoPlano(wrap,ev.target.result)
+    processarNovaImagem(wrap,ev.target.result)
   }
   reader.readAsDataURL(file)
   e.target.value=''
@@ -1594,11 +1620,10 @@ function salvarResumo(){
   const assunto=document.getElementById('f-assunto').value.trim()
   if(!titulo){toast('Informe o título','error');return}
   if(!disciplina){toast('Informe a disciplina','error');return}
-  if(window._uploadsPendentes>0){toast('Aguarde a imagem terminar de enviar...','error');return}
+  if(window._uploadsPendentes>0){toast('Aguarde a imagem terminar de processar...','error');return}
   const conteudo=getEditorHTML()
   const textoPlain=getEditorText()
   if(!textoPlain.trim()&&!conteudo.includes('<img')){toast('Escreva o conteúdo','error');return}
-  if(conteudo.includes('data:image')){toast('Uma imagem ainda não terminou de enviar — aguarde alguns segundos e tente salvar de novo','error');return}
   if(_editandoId){
     DB.update(_editandoId,{titulo,disciplina,assunto,conteudo,textoPlain,questoes:_questoesForm,updatedAt:new Date().toISOString()})
     toast('Resumo atualizado!')
@@ -2124,9 +2149,6 @@ import {
 import {
   getFirestore, collection, doc, setDoc, updateDoc, deleteDoc, onSnapshot
 } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js"
-import {
-  getStorage, ref, uploadBytes, getDownloadURL
-} from "https://www.gstatic.com/firebasejs/10.14.1/firebase-storage.js"
 
 // ────────────────────────────────────────────────────────────────────────────
 // COLE AQUI AS CREDENCIAIS DO SEU PROJETO FIREBASE
@@ -2149,13 +2171,12 @@ const firebaseConfig = {
 // ────────────────────────────────────────────────────────────────────────────
 const CODIGO_DO_CADERNO = "meu-caderno-principal"
 
-let app,auth,firestore,storage
+let app,auth,firestore
 let _falhaConfig=false
 try{
   app=initializeApp(firebaseConfig)
   auth=getAuth(app)
   firestore=getFirestore(app)
-  storage=getStorage(app)
   setPersistence(auth,browserLocalPersistence).catch(()=>{})
 }catch(e){
   _falhaConfig=true
@@ -2174,20 +2195,6 @@ function _rerenderTudo(){
   if(typeof window.renderBackup==='function') window.renderBackup()
 }
 
-// Sobe uma imagem (data URL base64) para o Firebase Storage e devolve a URL
-// pública dela. Isso existe porque o Firestore tem um limite de 1MB por
-// documento — guardar a imagem inteira em base64 dentro do resumo estoura
-// esse limite rapidinho. Guardando só a URL, o resumo fica leve.
-window.uploadImagemParaStorage=async function(dataUrl){
-  if(!storage) throw new Error('Firebase Storage não inicializado')
-  const res=await fetch(dataUrl)
-  const blob=await res.blob()
-  const ext=(blob.type.split('/')[1]||'png').replace('jpeg','jpg')
-  const nomeArquivo=`imagens/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`
-  const storageRef=ref(storage,nomeArquivo)
-  await uploadBytes(storageRef,blob)
-  return await getDownloadURL(storageRef)
-}
 function _toastSeDisponivel(msg,tipo){
   if(typeof window.toast==='function') window.toast(msg,tipo)
 }
